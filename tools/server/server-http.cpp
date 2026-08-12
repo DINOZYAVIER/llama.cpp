@@ -701,7 +701,11 @@ static void process_handler_response(server_http_req_ptr && request, server_http
                 sink.done();
                 SRV_DBG("%s", "http: stream ended\n");
             }
-            return has_next;
+            // cpp-httplib treats a false provider return as cancellation even
+            // after done() wrote the terminating zero-size chunk. Completion
+            // is represented by sink.done(); a successful provider call must
+            // therefore remain true so the terminator is flushed.
+            return true;
         };
         const auto on_complete = [request = q_ptr, response = r_ptr](bool) mutable {
             response.reset(); // trigger the destruction of the response object

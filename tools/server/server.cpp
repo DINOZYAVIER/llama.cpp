@@ -17,6 +17,7 @@
 #include <clocale>
 #include <cstdlib>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <unordered_set>
 #include <signal.h>
@@ -33,6 +34,18 @@ static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 static std::mutex agl_attempt_mutex;
 static std::string agl_active_attempt;
 static std::atomic<bool> agl_cancel_requested = false;
+
+struct agl_attempt_guard {
+    std::string id;
+
+    ~agl_attempt_guard() {
+        std::lock_guard<std::mutex> lock(agl_attempt_mutex);
+        if (agl_active_attempt == id) {
+            agl_active_attempt.clear();
+            agl_cancel_requested.store(false);
+        }
+    }
+};
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
@@ -84,22 +97,7 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
 // satisfies -Wmissing-declarations
 int llama_server(int argc, char ** argv);
 
-static int agl_private_inventory() {
-#if defined(_WIN32)
-    return -1;
-#else
-    const char * value = std::getenv("AGL_LLAMA_SERVER_INVENTORY_FD");
-    if (value == nullptr) {
-        return -1;
-    }
-    char * end = nullptr;
-    const long parsed = std::strtol(value, &end, 10);
-    if (end == value || *end != '\0' || parsed < 3 || parsed > INT_MAX) {
-        return 2;
-    }
-    common_init();
-    llama_backend_init();
-    ggml_backend_load_all();
+static json agl_inventory_payload() {
     json devices = json::array();
     for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
         ggml_backend_dev_props props = {};
@@ -121,11 +119,30 @@ static int agl_private_inventory() {
             {"physical_pool_bytes", props.memory_total},
         });
     }
-    const std::string payload = safe_json_to_str({
+    return {
         {"schema", "agentlibre.llama-inventory/v1"},
         {"llama_cpp_commit", llama_commit()},
         {"devices", std::move(devices)},
-    }) + "\n";
+    };
+}
+
+static int agl_private_inventory() {
+#if defined(_WIN32)
+    return -1;
+#else
+    const char * value = std::getenv("AGL_LLAMA_SERVER_INVENTORY_FD");
+    if (value == nullptr) {
+        return -1;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 3 || parsed > INT_MAX) {
+        return 2;
+    }
+    common_init();
+    llama_backend_init();
+    ggml_backend_load_all();
+    const std::string payload = safe_json_to_str(agl_inventory_payload()) + "\n";
     size_t offset = 0;
     while (offset < payload.size()) {
         const ssize_t written = ::write(static_cast<int>(parsed), payload.data() + offset, payload.size() - offset);
@@ -138,6 +155,12 @@ static int agl_private_inventory() {
     llama_backend_free();
     return 0;
 #endif
+}
+
+static server_http_res_ptr agl_private_live_inventory(const server_http_req &) {
+    auto response = std::make_unique<server_http_res>();
+    response->data = safe_json_to_str(agl_inventory_payload());
+    return response;
 }
 
 static server_http_res_ptr agl_private_generate(
@@ -174,16 +197,8 @@ static server_http_res_ptr agl_private_generate(
         agl_active_attempt = attempt_id;
         agl_cancel_requested.store(false);
     }
-    struct attempt_guard {
-        std::string id;
-        ~attempt_guard() {
-            std::lock_guard<std::mutex> lock(agl_attempt_mutex);
-            if (agl_active_attempt == id) {
-                agl_active_attempt.clear();
-                agl_cancel_requested.store(false);
-            }
-        }
-    } guard {attempt_id};
+    auto guard = std::make_shared<agl_attempt_guard>();
+    guard->id = attempt_id;
 
     auto & messages = body.at("messages");
     if (!messages.is_array()) {
@@ -246,19 +261,32 @@ static server_http_res_ptr agl_private_generate(
         throw std::invalid_argument("AGL multipart contains an unreferenced file");
     }
 
+    // The private protocol always streams bounded, identity-bearing frames.
+    // Product callers cannot select the stock SSE/non-streaming behavior.
+    body["stream"] = true;
+
     const std::function<bool()> should_stop = [&req]() {
         return agl_cancel_requested.load() || req.should_stop();
     };
-    const server_http_req normalized {
+    auto headers = req.headers;
+    headers["X-AGL-Attempt-ID"] = attempt_id;
+    auto normalized = std::make_shared<server_http_req>(server_http_req {
         req.params,
-        req.headers,
+        std::move(headers),
         req.path,
         req.query_string,
         body.dump(),
         {},
         should_stop,
-    };
-    return generate(normalized);
+    });
+    auto response = generate(*normalized);
+    if (response->is_stream()) {
+        auto next = std::move(response->next);
+        response->next = [next = std::move(next), normalized, guard](std::string & output) mutable {
+            return next(output);
+        };
+    }
+    return response;
 }
 
 static server_http_res_ptr agl_private_control(const server_http_req & req) {
@@ -398,6 +426,7 @@ int llama_server(int argc, char ** argv) {
             return 1;
         }
         ctx_http.get ("/agl/v1/readiness",     ex_wrapper(routes.get_props));
+        ctx_http.get ("/agl/v1/inventory",     ex_wrapper(agl_private_live_inventory));
         ctx_http.post("/agl/v1/generate",      ex_wrapper([&routes](const server_http_req & req) {
             return agl_private_generate(routes.post_chat_completions, req);
         }));
