@@ -330,6 +330,7 @@ struct server_task_result_cmpl_final : server_task_result {
     int32_t n_decoded;
     int32_t n_prompt_tokens;
     int32_t n_prompt_tokens_cache;
+    uint32_t n_prompt_chunks;
     int32_t n_tokens_cached;
     bool has_new_line;
     std::string stopping_word;

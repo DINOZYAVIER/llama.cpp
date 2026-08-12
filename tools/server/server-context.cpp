@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cmath>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -273,6 +274,9 @@ struct server_slot {
 
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
+    int32_t n_prompt_tokens_cache     = 0;
+    int32_t n_prompt_tokens_processed = 0;
+    uint32_t n_prompt_chunks = 0;
 
     size_t last_nl_pos = 0;
 
@@ -370,6 +374,8 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        n_prompt_tokens_cache = 0;
+        n_prompt_chunks = 0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -877,6 +883,13 @@ public:
             return nullptr;
         }
 
+        const char * plan_digest = std::getenv("AGL_INFERENCE_PLAN_DIGEST");
+        const char * reservation_id = std::getenv("AGL_INFERENCE_RESERVATION_ID");
+        const char * engine_generation = std::getenv("AGL_INFERENCE_ENGINE_GENERATION");
+        if (plan_digest == nullptr || reservation_id == nullptr || engine_generation == nullptr) {
+            throw std::runtime_error("AGL readiness identity is unavailable");
+        }
+
         json memory = json::array();
         for (const auto & entry : llama_get_memory_breakdown(ctx_tgt)) {
             ggml_backend_buffer_type_t buffer_type = entry.first;
@@ -893,10 +906,23 @@ public:
         }
         return {
             {"schema", "agentlibre.llama-readiness/v1"},
+            {"plan_digest", plan_digest},
+            {"reservation_id", reservation_id},
+            {"engine_generation", engine_generation},
             {"context_tokens", llama_n_ctx(ctx_tgt)},
             {"batch_size", llama_n_batch(ctx_tgt)},
             {"ubatch_size", llama_n_ubatch(ctx_tgt)},
             {"slot_count", slot_count},
+            {"speculative", {
+                {"enabled", ctx_dft != nullptr && params_base.speculative.types != std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_NONE}},
+                {"kind", common_speculative_type_name_str(params_base.speculative.types)},
+                {"max_draft_tokens", params_base.speculative.draft.n_max},
+                {"min_draft_tokens", params_base.speculative.draft.n_min},
+                {"p_min_millionths", static_cast<uint32_t>(std::lround(params_base.speculative.draft.p_min * 1000000.0f))},
+                {"gpu_layers", params_base.speculative.draft.n_gpu_layers},
+                {"key_cache_type", ggml_type_name(params_base.speculative.draft.cache_type_k)},
+                {"value_cache_type", ggml_type_name(params_base.speculative.draft.cache_type_v)},
+            }},
             {"memory", std::move(memory)},
         };
     }
@@ -2143,7 +2169,8 @@ private:
         res->truncated             = slot.truncated;
         res->n_decoded             = slot.stats.n_gen;
         res->n_prompt_tokens       = slot.task->n_tokens();
-        res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
+        res->n_prompt_tokens_cache = slot.n_prompt_tokens_cache;
+        res->n_prompt_chunks       = slot.n_prompt_chunks;
         res->n_tokens_cached       = slot.prompt.n_tokens();
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
@@ -4003,6 +4030,18 @@ private:
             }
             slot.spec_is_replay = false;
 
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
+                    slot.n_prompt_chunks++;
+                }
+
+                if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                    if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
+                        // prompt evaluated for embedding
+                        send_embedding(slot, batch_view);
+                        slot.release();
+                        slot.i_batch = -1;
+                        continue; // continue loop of slots
+                    }
             slot.stats.update_gen_last();
 
             // update how many tokens out of those tested were accepted
@@ -4279,6 +4318,75 @@ void server_context::set_state_callback(server_state_callback_t callback) {
     impl->callback_state = std::move(callback);
 }
 
+static std::string format_agl_stream_frame(
+        server_task_result & result,
+        const std::string & attempt_id,
+        uint64_t & sequence,
+        std::string & raw_output,
+        bool & terminal) {
+    if (result.is_error()) {
+        terminal = true;
+        return safe_json_to_str({
+            {"schema", "agentlibre.llama-stream/v1"},
+            {"attempt_id", attempt_id},
+            {"sequence", ++sequence},
+            {"kind", "error"},
+            {"error", result.to_json()},
+        }) + "\n";
+    }
+
+    if (auto * partial = dynamic_cast<server_task_result_cmpl_partial *>(&result)) {
+        // Force the same state update/assertions as the stock projection, but
+        // carry the exact native text rather than normalized OAI deltas.
+        (void) partial->to_json();
+        if (partial->content.empty()) {
+            return {};
+        }
+        raw_output += partial->content;
+        return safe_json_to_str({
+            {"schema", "agentlibre.llama-stream/v1"},
+            {"attempt_id", attempt_id},
+            {"sequence", ++sequence},
+            {"kind", "delta"},
+            {"content", partial->content},
+        }) + "\n";
+    }
+
+    auto * final = dynamic_cast<server_task_result_cmpl_final *>(&result);
+    GGML_ASSERT(final != nullptr);
+    (void) final->to_json();
+    if (raw_output != final->content) {
+        throw std::runtime_error("AGL streamed raw output disagrees with final native output");
+    }
+    std::string finish_reason = "length";
+    if (final->stop == STOP_TYPE_WORD || final->stop == STOP_TYPE_EOS) {
+        finish_reason = final->oaicompat_msg.tool_calls.empty() ? "stop" : "tool_calls";
+    }
+    terminal = true;
+    return safe_json_to_str({
+        {"schema", "agentlibre.llama-stream/v1"},
+        {"attempt_id", attempt_id},
+        {"sequence", ++sequence},
+        {"kind", "final"},
+        {"finish_reason", finish_reason},
+        {"raw_output", final->content},
+        {"message", final->oaicompat_msg.to_json_oaicompat()},
+        {"usage", {
+            {"prompt_tokens", final->n_prompt_tokens},
+            {"completion_tokens", final->n_decoded},
+        }},
+        {"prefill", {
+            {"tokens", final->n_prompt_tokens},
+            {"cached_tokens", final->n_prompt_tokens_cache},
+            {"chunks", final->n_prompt_chunks},
+        }},
+    }) + "\n";
+}
+
+void server_context::on_sleeping_changed(std::function<void(bool)> callback) {
+    impl->queue_tasks.on_sleeping_state(std::move(callback));
+}
+
 //
 // server_routes
 //
@@ -4394,6 +4502,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 json encoded = res->to_json();
                 if (include_agl_raw) {
                     encoded["agl_raw_output"] = final->content;
+                    encoded["agl_prefill"] = {
+                        {"tokens", final->n_prompt_tokens},
+                        {"cached_tokens", final->n_prompt_tokens_cache},
+                        {"chunks", final->n_prompt_chunks},
+                    };
                     if (encoded.contains("choices") && encoded["choices"].is_array() &&
                         !encoded["choices"].empty() && encoded["choices"][0].contains("message")) {
                         encoded["choices"][0]["message"]["content"] = final->content;
@@ -4436,6 +4549,62 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
             dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
         );
+
+        const auto agl_protocol = req.headers.find("X-AGL-Protocol");
+        const auto agl_attempt = req.headers.find("X-AGL-Attempt-ID");
+        const bool agl_stream = agl_protocol != req.headers.end() && agl_protocol->second == "1";
+        if (agl_stream && (agl_attempt == req.headers.end() || agl_attempt->second.empty())) {
+            res->error(format_error_response("AGL stream omitted attempt identity", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        if (agl_stream) {
+            auto sequence = std::make_shared<uint64_t>(0);
+            auto raw_output = std::make_shared<std::string>();
+            bool terminal = false;
+            res->data = format_agl_stream_frame(
+                    *first_result,
+                    agl_attempt->second,
+                    *sequence,
+                    *raw_output,
+                    terminal);
+            res->status = 200;
+            res->content_type = "application/x-ndjson";
+            res->next = [res_this = res.get(), &req, attempt_id = agl_attempt->second,
+                         sequence, raw_output, terminal](std::string & output) mutable -> bool {
+                try {
+                    if (!res_this->data.empty()) {
+                        output = std::move(res_this->data);
+                        res_this->data.clear();
+                        return true;
+                    }
+                    if (terminal) {
+                        return false;
+                    }
+                    auto result = res_this->rd.next(req.should_stop);
+                    if (result == nullptr) {
+                        if (req.should_stop()) {
+                            return false;
+                        }
+                        throw std::runtime_error("AGL result stream ended without a terminal frame");
+                    }
+                    output = format_agl_stream_frame(
+                            *result, attempt_id, *sequence, *raw_output, terminal);
+                    return true;
+                } catch (const std::exception & e) {
+                    terminal = true;
+                    output = safe_json_to_str({
+                        {"schema", "agentlibre.llama-stream/v1"},
+                        {"attempt_id", attempt_id},
+                        {"sequence", ++*sequence},
+                        {"kind", "error"},
+                        {"error", {{"message", e.what()}}},
+                    }) + "\n";
+                    return true;
+                }
+            };
+            return res;
+        }
 
         // next responses are streamed
         // to be sent immediately
