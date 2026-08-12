@@ -4355,9 +4355,13 @@ static std::string format_agl_stream_frame(
     auto * final = dynamic_cast<server_task_result_cmpl_final *>(&result);
     GGML_ASSERT(final != nullptr);
     (void) final->to_json();
-    if (raw_output != final->content) {
+    // llama.cpp intentionally clears final->content for streaming tasks: the
+    // exact bytes have already been emitted by partial results. Non-streaming
+    // tasks still carry the complete final content and must agree exactly.
+    if (!final->stream && raw_output != final->content) {
         throw std::runtime_error("AGL streamed raw output disagrees with final native output");
     }
+    const std::string & final_output = final->stream ? raw_output : final->content;
     std::string finish_reason = "length";
     if (final->stop == STOP_TYPE_WORD || final->stop == STOP_TYPE_EOS) {
         finish_reason = final->oaicompat_msg.tool_calls.empty() ? "stop" : "tool_calls";
@@ -4369,7 +4373,7 @@ static std::string format_agl_stream_frame(
         {"sequence", ++sequence},
         {"kind", "final"},
         {"finish_reason", finish_reason},
-        {"raw_output", final->content},
+        {"raw_output", final_output},
         {"message", final->oaicompat_msg.to_json_oaicompat()},
         {"usage", {
             {"prompt_tokens", final->n_prompt_tokens},
