@@ -265,8 +265,11 @@ static server_http_res_ptr agl_private_generate(
     // Product callers cannot select the stock SSE/non-streaming behavior.
     body["stream"] = true;
 
-    const std::function<bool()> should_stop = [&req]() {
-        return agl_cancel_requested.load() || req.should_stop();
+    // The private host owns cancellation through the typed control route.
+    // cpp-httplib's stock connection predicate is not authoritative for the
+    // inherited Unix connection and can report closed after the begin frame.
+    const std::function<bool()> should_stop = []() {
+        return agl_cancel_requested.load();
     };
     auto headers = req.headers;
     headers["X-AGL-Attempt-ID"] = attempt_id;
