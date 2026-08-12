@@ -3850,6 +3850,8 @@ static std::string format_agl_stream_frame(
         finish_reason = final->oaicompat_msg.tool_calls.empty() ? "stop" : "tool_calls";
     }
     terminal = true;
+    SRV_INF("AGL stream terminal: attempt=%s sequence=%" PRIu64 " bytes=%zu\n",
+            attempt_id.c_str(), sequence + 1, final_output.size());
     return safe_json_to_str({
         {"schema", "agentlibre.llama-stream/v1"},
         {"attempt_id", attempt_id},
