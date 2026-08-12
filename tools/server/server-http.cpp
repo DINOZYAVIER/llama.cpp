@@ -146,6 +146,12 @@ bool server_http_context::init(const common_params & params) {
 #endif
 
     srv->set_default_headers({{"Server", "llama.cpp"}});
+    if (inherited_listen_fd >= 0) {
+        // The filesystem name is removed before exec, so the two inherited AGL
+        // channels must remain usable for the complete resident generation.
+        srv->set_keep_alive_max_count(1000000);
+        srv->set_keep_alive_timeout(900);
+    }
     // srv->set_logger(log_server_request); // TODO @ngxson : this is too spamy, no very useful; improve it in the future
     srv->set_exception_handler([](const httplib::Request &, httplib::Response & res, const std::exception_ptr & ep) {
         // this is fail-safe; exceptions should already handled by `ex_wrapper`

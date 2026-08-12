@@ -5,6 +5,7 @@
 #include "server-tools.h"
 
 #include "arg.h"
+#include "base64.hpp"
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
@@ -16,6 +17,8 @@
 #include <clocale>
 #include <cstdlib>
 #include <exception>
+#include <mutex>
+#include <unordered_set>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
 
@@ -27,6 +30,9 @@
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+static std::mutex agl_attempt_mutex;
+static std::string agl_active_attempt;
+static std::atomic<bool> agl_cancel_requested = false;
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
@@ -132,6 +138,150 @@ static int agl_private_inventory() {
     llama_backend_free();
     return 0;
 #endif
+}
+
+static server_http_res_ptr agl_private_generate(
+        const server_http_context::handler_t & generate,
+        const server_http_req & req) {
+    constexpr size_t AGL_MAX_MEDIA_BYTES = 64 * 1024 * 1024;
+    constexpr size_t AGL_MAX_MEDIA_PARTS = 64;
+
+    json body;
+    if (req.files.empty()) {
+        body = json::parse(req.body);
+    } else {
+        if (req.files.size() > AGL_MAX_MEDIA_PARTS) {
+            throw std::invalid_argument("AGL media part count exceeds 64");
+        }
+        const json envelope = json::parse(req.body);
+        if (!envelope.is_object() || envelope.size() != 1 || !envelope.contains("request") ||
+            !envelope.at("request").is_string()) {
+            throw std::invalid_argument("AGL multipart body must contain one request field");
+        }
+        body = json::parse(envelope.at("request").get<std::string>());
+    }
+
+    const std::string attempt_id = json_value(body, "agl_attempt_id", std::string());
+    if (attempt_id.empty() || attempt_id.size() > 128) {
+        throw std::invalid_argument("AGL generation omitted a bounded attempt identity");
+    }
+    body.erase("agl_attempt_id");
+    {
+        std::lock_guard<std::mutex> lock(agl_attempt_mutex);
+        if (!agl_active_attempt.empty()) {
+            throw std::invalid_argument("AGL private engine already has an active attempt");
+        }
+        agl_active_attempt = attempt_id;
+        agl_cancel_requested.store(false);
+    }
+    struct attempt_guard {
+        std::string id;
+        ~attempt_guard() {
+            std::lock_guard<std::mutex> lock(agl_attempt_mutex);
+            if (agl_active_attempt == id) {
+                agl_active_attempt.clear();
+                agl_cancel_requested.store(false);
+            }
+        }
+    } guard {attempt_id};
+
+    auto & messages = body.at("messages");
+    if (!messages.is_array()) {
+        throw std::invalid_argument("AGL messages must be an array");
+    }
+    std::unordered_set<std::string> used;
+    size_t total_media_bytes = 0;
+    for (auto & message : messages) {
+        if (!message.is_object() || !message.contains("content")) {
+            continue;
+        }
+        auto & content = message["content"];
+        if (!content.is_array()) {
+            continue;
+        }
+        for (auto & part : content) {
+            if (!part.is_object()) {
+                throw std::invalid_argument("AGL message content part must be an object");
+            }
+            const std::string type = json_value(part, "type", std::string());
+            if (type == "text") {
+                if (!part.contains("text") || !part.at("text").is_string()) {
+                    throw std::invalid_argument("AGL text content part is invalid");
+                }
+                continue;
+            }
+            if (type != "agl_attachment") {
+                throw std::invalid_argument("private AGL generation rejects URL and path media");
+            }
+            const std::string id = json_value(part, "id", std::string());
+            const std::string media_type = json_value(part, "media_type", std::string());
+            const uint64_t byte_length = json_value(part, "byte_length", UINT64_C(0));
+            if (id.empty() || !used.insert(id).second) {
+                throw std::invalid_argument("AGL attachment identity is empty or duplicated");
+            }
+            const auto found = req.files.find(id);
+            if (found == req.files.end()) {
+                throw std::invalid_argument("AGL attachment bytes are missing");
+            }
+            const auto & file = found->second;
+            if ((media_type != "image/png" && media_type != "image/jpeg") ||
+                file.content_type != media_type || file.filename != id ||
+                byte_length != file.data.size()) {
+                throw std::invalid_argument("AGL attachment metadata does not match multipart bytes");
+            }
+            if (file.data.size() > AGL_MAX_MEDIA_BYTES - total_media_bytes) {
+                throw std::invalid_argument("AGL media bytes exceed 64 MiB");
+            }
+            total_media_bytes += file.data.size();
+            const auto * data = reinterpret_cast<const char *>(file.data.data());
+            part = {
+                {"type", "image_url"},
+                {"image_url", {
+                    {"url", "data:" + media_type + ";base64," + base64::encode(data, file.data.size())},
+                }},
+            };
+        }
+    }
+    if (used.size() != req.files.size()) {
+        throw std::invalid_argument("AGL multipart contains an unreferenced file");
+    }
+
+    const std::function<bool()> should_stop = [&req]() {
+        return agl_cancel_requested.load() || req.should_stop();
+    };
+    const server_http_req normalized {
+        req.params,
+        req.headers,
+        req.path,
+        req.query_string,
+        body.dump(),
+        {},
+        should_stop,
+    };
+    return generate(normalized);
+}
+
+static server_http_res_ptr agl_private_control(const server_http_req & req) {
+    const json body = json::parse(req.body);
+    const std::string attempt_id = json_value(body, "attempt_id", std::string());
+    const std::string action = json_value(body, "action", std::string());
+    if (attempt_id.empty() || action != "cancel" || body.size() != 2) {
+        throw std::invalid_argument("invalid AGL control request");
+    }
+    {
+        std::lock_guard<std::mutex> lock(agl_attempt_mutex);
+        if (agl_active_attempt != attempt_id) {
+            throw std::invalid_argument("AGL control attempt is not active");
+        }
+        agl_cancel_requested.store(true);
+    }
+    auto response = std::make_unique<server_http_res>();
+    response->data = safe_json_to_str({
+        {"schema", "agentlibre.llama-cancel/v1"},
+        {"attempt_id", attempt_id},
+        {"acknowledged", true},
+    });
+    return response;
 }
 
 int llama_server(int argc, char ** argv) {
@@ -248,8 +398,10 @@ int llama_server(int argc, char ** argv) {
             return 1;
         }
         ctx_http.get ("/agl/v1/readiness",     ex_wrapper(routes.get_props));
-        ctx_http.post("/agl/v1/generate",      ex_wrapper(routes.post_chat_completions));
-        ctx_http.post("/agl/v1/control",       ex_wrapper(routes.post_control));
+        ctx_http.post("/agl/v1/generate",      ex_wrapper([&routes](const server_http_req & req) {
+            return agl_private_generate(routes.post_chat_completions, req);
+        }));
+        ctx_http.post("/agl/v1/control",       ex_wrapper(agl_private_control));
         ctx_http.post("/agl/v1/slot/:id_slot", ex_wrapper(routes.post_slots));
     } else {
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
