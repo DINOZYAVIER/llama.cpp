@@ -76,6 +76,7 @@ struct server_http_context {
     std::string hostname;
     int port    = 8080;
     bool is_ssl = false;
+    int inherited_listen_fd = -1;
 
     server_http_context();
     ~server_http_context();
@@ -83,6 +84,7 @@ struct server_http_context {
     bool init(const common_params & params);
     bool start();
     void stop() const;
+    bool is_private_inherited() const { return inherited_listen_fd >= 0; }
 
     void get(const std::string & path, const handler_t & handler) const;
     void post(const std::string & path, const handler_t & handler) const;
