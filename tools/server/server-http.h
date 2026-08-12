@@ -53,7 +53,9 @@ struct server_http_req {
     std::string query_string; // query parameters string (e.g. "action=save")
     std::string body;
     std::map<std::string, uploaded_file> files; // used for file uploads (form data)
-    const std::function<bool()> & should_stop;
+    // A streamed response can outlive its routing handler. Own the callback so
+    // private adapters never retain a reference to handler-local state.
+    std::function<bool()> should_stop;
 
     std::string get_param(const std::string & key, const std::string & def = "") const {
         auto it = params.find(key);
