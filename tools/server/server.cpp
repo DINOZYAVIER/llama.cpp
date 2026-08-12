@@ -13,13 +13,17 @@
 #include "log.h"
 
 #include <atomic>
+#include <climits>
 #include <clocale>
+#include <cstdlib>
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
 
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 static std::function<void(int)> shutdown_handler;
@@ -92,6 +96,69 @@ int llama_server(int argc, char ** argv) {
     // Ignore SIGPIPE so the server does not crash if a child (MCP server, tools runtime) exits while we are writing to its stdin
     signal(SIGPIPE, SIG_IGN);
 #endif
+
+static int agl_private_inventory() {
+#if defined(_WIN32)
+    return -1;
+#else
+    const char * value = std::getenv("AGL_LLAMA_SERVER_INVENTORY_FD");
+    if (value == nullptr) {
+        return -1;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 3 || parsed > INT_MAX) {
+        return 2;
+    }
+    common_init();
+    llama_backend_init();
+    ggml_backend_load_all();
+    json devices = json::array();
+    for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+        ggml_backend_dev_props props = {};
+        ggml_backend_dev_get_props(ggml_backend_dev_get(index), &props);
+        const char * kind = "unknown";
+        switch (props.type) {
+            case GGML_BACKEND_DEVICE_TYPE_CPU:   kind = "cpu"; break;
+            case GGML_BACKEND_DEVICE_TYPE_GPU:   kind = "discrete_gpu"; break;
+            case GGML_BACKEND_DEVICE_TYPE_IGPU:  kind = "integrated_gpu"; break;
+            case GGML_BACKEND_DEVICE_TYPE_ACCEL: kind = "accelerator"; break;
+            case GGML_BACKEND_DEVICE_TYPE_META:  kind = "metadata"; break;
+        }
+        devices.push_back({
+            {"identity", props.name == nullptr ? "" : props.name},
+            {"description", props.description == nullptr ? "" : props.description},
+            {"native_device_id", props.device_id == nullptr ? "" : props.device_id},
+            {"kind", kind},
+            {"available_pool_bytes", props.memory_free},
+            {"physical_pool_bytes", props.memory_total},
+        });
+    }
+    const std::string payload = safe_json_to_str({
+        {"schema", "agentlibre.llama-inventory/v1"},
+        {"llama_cpp_commit", llama_commit()},
+        {"devices", std::move(devices)},
+    }) + "\n";
+    size_t offset = 0;
+    while (offset < payload.size()) {
+        const ssize_t written = ::write(static_cast<int>(parsed), payload.data() + offset, payload.size() - offset);
+        if (written <= 0) {
+            llama_backend_free();
+            return 3;
+        }
+        offset += static_cast<size_t>(written);
+    }
+    llama_backend_free();
+    return 0;
+#endif
+}
+
+int llama_server(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
+
+    if (const int inventory = agl_private_inventory(); inventory >= 0) {
+        return inventory;
+    }
 
     // own arguments required by this example
     common_params params;
@@ -243,6 +310,16 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
     }
 
+    if (ctx_http.is_private_inherited()) {
+        if (is_router_server) {
+            SRV_ERR("%s", "router mode is unavailable on the AGL inherited listener\n");
+            return 1;
+        }
+        ctx_http.get ("/agl/v1/readiness",     ex_wrapper(routes.get_props));
+        ctx_http.post("/agl/v1/generate",      ex_wrapper(routes.post_chat_completions));
+        ctx_http.post("/agl/v1/control",       ex_wrapper(routes.post_control));
+        ctx_http.post("/agl/v1/slot/:id_slot", ex_wrapper(routes.post_slots));
+    } else {
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
@@ -397,6 +474,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
             SRV_ERR("failed to download model: %s\n", e.what());
             return 1;
         }
+    }
     }
 
     //

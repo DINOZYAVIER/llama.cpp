@@ -872,6 +872,35 @@ public:
         metrics.reset_bucket();
     }
 
+    json agl_readiness(const int32_t slot_count) const {
+        if (ctx_tgt == nullptr) {
+            return nullptr;
+        }
+
+        json memory = json::array();
+        for (const auto & entry : llama_get_memory_breakdown(ctx_tgt)) {
+            ggml_backend_buffer_type_t buffer_type = entry.first;
+            ggml_backend_dev_t device = ggml_backend_buft_get_device(buffer_type);
+            const bool host_pool = ggml_backend_buft_is_host(buffer_type) ||
+                (device != nullptr && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU);
+            memory.push_back({
+                {"pool", host_pool ? "host" : "device"},
+                {"device", device == nullptr ? "" : ggml_backend_dev_name(device)},
+                {"model_bytes", entry.second.model},
+                {"context_bytes", entry.second.context},
+                {"compute_bytes", entry.second.compute},
+            });
+        }
+        return {
+            {"schema", "agentlibre.llama-readiness/v1"},
+            {"context_tokens", llama_n_ctx(ctx_tgt)},
+            {"batch_size", llama_n_batch(ctx_tgt)},
+            {"ubatch_size", llama_n_ubatch(ctx_tgt)},
+            {"slot_count", slot_count},
+            {"memory", std::move(memory)},
+        };
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -4357,9 +4386,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             return res;
         } else {
             json arr = json::array();
+            const auto agl_protocol = req.headers.find("X-AGL-Protocol");
+            const bool include_agl_raw = agl_protocol != req.headers.end() && agl_protocol->second == "1";
             for (auto & res : all_results.results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
-                arr.push_back(res->to_json());
+                auto * final = dynamic_cast<server_task_result_cmpl_final*>(res.get());
+                GGML_ASSERT(final != nullptr);
+                json encoded = res->to_json();
+                if (include_agl_raw) {
+                    encoded["agl_raw_output"] = final->content;
+                    if (encoded.contains("choices") && encoded["choices"].is_array() &&
+                        !encoded["choices"].empty() && encoded["choices"][0].contains("message")) {
+                        encoded["choices"][0]["message"]["content"] = final->content;
+                    }
+                }
+                arr.push_back(std::move(encoded));
             }
             GGML_ASSERT(!arr.empty() && "empty results");
             if (arr.size() == 1) {
@@ -4801,15 +4841,60 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->get_props = [this](const server_http_req &) {
+    this->get_props = [this](const server_http_req & req) {
         auto res = create_response(true);
-        // note: do NOT use ctx_server here, this endpoint must be accessible during sleep
-        if (queue_tasks.is_sleeping()) {
-            std::unique_lock<std::mutex> lock(mutex_cache);
-            res->ok(cached_props);
-        } else {
-            res->ok(get_res_props(*meta, params, false));
+
+        task_params tparams;
+        tparams.sampling = params.sampling;
+        json default_generation_settings_for_props = json {
+            { "params", tparams.to_json(true) },
+            { "n_ctx",  meta->slot_n_ctx },
+        };
+
+        std::string tmpl_default = common_chat_templates_source(meta->chat_params.tmpls.get(), "");
+        std::string tmpl_tools   = common_chat_templates_source(meta->chat_params.tmpls.get(), "tool_use");
+
+        json props = {
+            { "default_generation_settings", default_generation_settings_for_props },
+            { "total_slots",                 params.n_parallel },
+            { "model_alias",                 meta->model_name },
+            { "model_path",                  meta->model_path },
+            { "modalities",                  json {
+                {"vision", meta->has_inp_image},
+                {"video",  meta->has_inp_video},
+                {"audio",  meta->has_inp_audio},
+            } },
+            { "media_marker",                get_media_marker() },
+            { "endpoint_slots",              params.endpoint_slots },
+            { "endpoint_props",              params.endpoint_props },
+            { "endpoint_metrics",            params.endpoint_metrics },
+            // New keys
+            { "ui",                           params.ui },
+            { "ui_settings",                  meta->json_ui_settings },
+            // Deprecated: use ui/ui_settings instead (kept for backward compat)
+            { "webui",                        params.webui },
+            { "webui_settings",               meta->json_webui_settings },
+            { "chat_template",               tmpl_default },
+            { "chat_template_caps",          meta->chat_template_caps },
+            { "bos_token",                   meta->bos_token_str },
+            { "eos_token",                   meta->eos_token_str },
+            { "build_info",                  meta->build_info },
+            { "is_sleeping",                 queue_tasks.is_sleeping() },
+            { "cors_proxy_enabled",          params.ui_mcp_proxy || params.webui_mcp_proxy },
+        };
+        const auto agl_protocol = req.headers.find("X-AGL-Protocol");
+        if (agl_protocol != req.headers.end() && agl_protocol->second == "1") {
+            const json readiness = ctx_server.agl_readiness(params.n_parallel);
+            if (!readiness.is_null()) {
+                props["agl"] = readiness;
+            }
         }
+        if (params.use_jinja) {
+            if (!tmpl_tools.empty()) {
+                props["chat_template_tool_use"] = tmpl_tools;
+            }
+        }
+        res->ok(std::move(props));
         return res;
     };
 

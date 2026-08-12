@@ -8,6 +8,8 @@
 
 #include <functional>
 #include <future>
+#include <climits>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <thread>
@@ -19,6 +21,17 @@
 class server_http_context::Impl {
 public:
     std::unique_ptr<httplib::Server> srv;
+};
+
+class inherited_fd_server final : public httplib::Server {
+public:
+    bool adopt(int fd) {
+        if (fd < 0 || svr_sock_.load() != INVALID_SOCKET) {
+            return false;
+        }
+        svr_sock_.store(fd);
+        return true;
+    }
 };
 
 server_http_context::server_http_context()
@@ -88,6 +101,16 @@ struct gcp_params {
 bool server_http_context::init(const common_params & params) {
     const gcp_params gcp;
 
+    if (const char * value = std::getenv("AGL_LLAMA_SERVER_LISTEN_FD")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || parsed < 3 || parsed > INT_MAX) {
+            SRV_ERR("%s", "invalid AGL inherited listen descriptor\n");
+            return false;
+        }
+        inherited_listen_fd = static_cast<int>(parsed);
+    }
+
     path_prefix = params.api_prefix;
     port = params.port;
     hostname = params.hostname;
@@ -105,7 +128,13 @@ bool server_http_context::init(const common_params & params) {
     auto & srv = pimpl->srv;
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-    if (!params.ssl_file_key.empty() && !params.ssl_file_cert.empty()) {
+    if (inherited_listen_fd >= 0) {
+        if (!params.ssl_file_key.empty() || !params.ssl_file_cert.empty()) {
+            SRV_ERR("%s", "TLS is unavailable on the AGL inherited listener\n");
+            return false;
+        }
+        srv = std::make_unique<inherited_fd_server>();
+    } else if (!params.ssl_file_key.empty() && !params.ssl_file_cert.empty()) {
         SRV_TRC("running with SSL: key = %s, cert = %s\n", params.ssl_file_key.c_str(), params.ssl_file_cert.c_str());
         srv = std::make_unique<httplib::SSLServer>(
             params.ssl_file_cert.c_str(), params.ssl_file_key.c_str()
@@ -120,7 +149,11 @@ bool server_http_context::init(const common_params & params) {
         SRV_ERR("%s", "the server is built without SSL support\n");
         return false;
     }
-    srv.reset(new httplib::Server());
+    if (inherited_listen_fd >= 0) {
+        srv = std::make_unique<inherited_fd_server>();
+    } else {
+        srv.reset(new httplib::Server());
+    }
 #endif
 
     srv->set_default_headers({{"Server", "llama.cpp"}});
@@ -161,6 +194,9 @@ bool server_http_context::init(const common_params & params) {
     // set timeouts and change hostname and port
     srv->set_read_timeout (params.timeout_read);
     srv->set_write_timeout(params.timeout_write);
+    if (inherited_listen_fd >= 0) {
+        srv->set_payload_max_length(72 * 1024 * 1024);
+    }
     srv->set_socket_options([reuse_port = params.reuse_port](const socket_t sock) {
         httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
         if (reuse_port) {
@@ -311,12 +347,14 @@ bool server_http_context::init(const common_params & params) {
         // +4 threads for monitoring, health and some threads reserved for MCP and other tasks in the future
         n_threads_http = std::max(params.n_parallel + 4, static_cast<int32_t>(std::thread::hardware_concurrency() - 1));
     }
-    SRV_TRC("using %d threads for HTTP server\n", n_threads_http);
-    srv->new_task_queue = [n_threads_http] {
+    SRV_INF("using %d threads for HTTP server\n", n_threads_http);
+    srv->new_task_queue = [n_threads_http, private_inherited = inherited_listen_fd >= 0] {
         // spawn n_threads_http fixed thread (always alive), while allow up to 1024 max possible additional threads
         // when n_threads_http is used, server will create new "dynamic" threads that will be destroyed after processing each request
         // ref: https://github.com/yhirose/cpp-httplib/pull/2368
-        const auto max_threads = static_cast<size_t>(n_threads_http + 1024);
+        const auto max_threads = private_inherited
+            ? static_cast<size_t>(n_threads_http)
+            : static_cast<size_t>(n_threads_http + 1024);
         return new httplib::ThreadPool(n_threads_http, max_threads);
     };
 
@@ -435,7 +473,10 @@ bool server_http_context::start() {
     const auto & srv = pimpl->srv;
     auto was_bound = false;
     auto is_sock = false;
-    if (string_ends_with(std::string(hostname), ".sock")) {
+    if (inherited_listen_fd >= 0) {
+        auto * inherited = dynamic_cast<inherited_fd_server *>(srv.get());
+        was_bound = inherited != nullptr && inherited->adopt(inherited_listen_fd);
+    } else if (string_ends_with(std::string(hostname), ".sock")) {
         is_sock = true;
         SRV_TRC("%s", "setting address family to AF_UNIX\n");
         srv->set_address_family(AF_UNIX);
@@ -465,7 +506,8 @@ bool server_http_context::start() {
     thread = std::thread([this] { pimpl->srv->listen_after_bind(); });
     srv->wait_until_ready();
 
-    listening_address = is_sock ? string_format("unix://%s", hostname.c_str())
+    listening_address = inherited_listen_fd >= 0 ? "inherited://agl"
+                      : is_sock ? string_format("unix://%s", hostname.c_str())
                                 : string_format("%s://%s:%d", is_ssl ? "https" : "http", common_http_format_host(hostname).c_str(), port);
     return true;
 }
