@@ -14,6 +14,7 @@
 #include "log.h"
 
 #include <atomic>
+#include <cerrno>
 #include <climits>
 #include <clocale>
 #include <cstdlib>
@@ -35,6 +36,36 @@ static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 static std::mutex agl_attempt_mutex;
 static std::string agl_active_attempt;
 static std::atomic<bool> agl_cancel_requested = false;
+
+static bool agl_start_parent_watch() {
+#if defined(_WIN32)
+    return true;
+#else
+    const char * value = std::getenv("AGL_LLAMA_SERVER_PARENT_FD");
+    if (value == nullptr) {
+        return true;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 3 || parsed > INT_MAX) {
+        return false;
+    }
+    const int fd = static_cast<int>(parsed);
+    std::thread([fd]() {
+        char byte;
+        for (;;) {
+            const ssize_t result = ::read(fd, &byte, 1);
+            if (result < 0 && errno == EINTR) {
+                continue;
+            }
+            // The host never writes. EOF proves that the process-level owner
+            // closed its write end; every other result is a protocol failure.
+            _exit(137);
+        }
+    }).detach();
+    return true;
+#endif
+}
 
 struct agl_attempt_guard {
     std::string id;
@@ -336,6 +367,11 @@ static server_http_res_ptr agl_private_control(const server_http_req & req) {
 
 int llama_server(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+
+    if (!agl_start_parent_watch()) {
+        fprintf(stderr, "invalid AGL parent lifetime descriptor\n");
+        return 1;
+    }
 
     if (const int inventory = agl_private_inventory(); inventory >= 0) {
         return inventory;
