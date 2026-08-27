@@ -5016,7 +5016,7 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->get_props = [this](const server_http_req & req) {
+    this->get_props = [this](const server_http_req &) {
         auto res = create_response(true);
 
         task_params tparams;
@@ -5057,19 +5057,23 @@ void server_routes::init_routes() {
             { "is_sleeping",                 queue_tasks.is_sleeping() },
             { "cors_proxy_enabled",          params.ui_mcp_proxy || params.webui_mcp_proxy },
         };
-        const auto agl_protocol = req.headers.find("X-AGL-Protocol");
-        if (agl_protocol != req.headers.end() && agl_protocol->second == "1") {
-            const json readiness = ctx_server.agl_readiness(params.n_parallel);
-            if (!readiness.is_null()) {
-                props["agl"] = readiness;
-            }
-        }
         if (params.use_jinja) {
             if (!tmpl_tools.empty()) {
                 props["chat_template_tool_use"] = tmpl_tools;
             }
         }
         res->ok(std::move(props));
+        return res;
+    };
+
+    this->get_agl_readiness = [this](const server_http_req &) {
+        auto res = create_response(true);
+        const json readiness = ctx_server.agl_readiness(params.n_parallel);
+        if (readiness.is_null()) {
+            res->error(format_error_response("AGL readiness is unavailable", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+        res->ok(readiness);
         return res;
     };
 

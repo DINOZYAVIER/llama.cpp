@@ -532,7 +532,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
             SRV_ERR("%s", "router mode is unavailable on the AGL inherited listener\n");
             return 1;
         }
-        ctx_http.get ("/agl/v1/readiness",     ex_wrapper(routes.get_props));
+        ctx_http.get ("/agl/v1/readiness",     ex_wrapper(routes.get_agl_readiness));
         ctx_http.get ("/agl/v1/inventory",     ex_wrapper(agl_private_live_inventory));
         ctx_http.post("/agl/v1/generate",      ex_wrapper([&routes](const server_http_req & req) {
             return agl_private_generate(routes.post_chat_completions, req);
