@@ -913,6 +913,7 @@ public:
             {"batch_size", llama_n_batch(ctx_tgt)},
             {"ubatch_size", llama_n_ubatch(ctx_tgt)},
             {"slot_count", slot_count},
+            {"reasoning_supported", params_base.use_jinja && common_chat_templates_support_enable_thinking(chat_params.tmpls.get())},
             {"speculative", {
                 {"enabled", ctx_dft != nullptr && params_base.speculative.types != std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_NONE}},
                 {"kind", common_speculative_type_name_str(params_base.speculative.types)},
@@ -4600,13 +4601,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             res->next = [res_this = res.get(), &req, attempt_id = agl_attempt->second,
                          sequence, raw_output, terminal](std::string & output) mutable -> bool {
                 try {
+                    if (terminal) {
+                        return false;
+                    }
+                    if (req.should_stop()) {
+                        terminal = true;
+                        res_this->data.clear();
+                        output = format_agl_stream_error_frame(
+                                attempt_id, *sequence, {{"message", "cancelled"}});
+                        return true;
+                    }
                     if (!res_this->data.empty()) {
                         output = std::move(res_this->data);
                         res_this->data.clear();
                         return true;
-                    }
-                    if (terminal) {
-                        return false;
                     }
                     auto result = res_this->rd.next(req.should_stop);
                     if (result == nullptr) {
