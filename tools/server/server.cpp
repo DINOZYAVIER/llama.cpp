@@ -21,6 +21,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
@@ -34,8 +35,12 @@
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 static std::mutex agl_attempt_mutex;
-static std::string agl_active_attempt;
-static std::atomic<bool> agl_cancel_requested = false;
+
+struct agl_attempt_state {
+    std::atomic<bool> cancel_requested = false;
+};
+
+static std::unordered_map<std::string, std::shared_ptr<agl_attempt_state>> agl_active_attempts;
 
 static bool agl_start_parent_watch() {
 #if defined(_WIN32)
@@ -69,12 +74,13 @@ static bool agl_start_parent_watch() {
 
 struct agl_attempt_guard {
     std::string id;
+    std::shared_ptr<agl_attempt_state> state;
 
     ~agl_attempt_guard() {
         std::lock_guard<std::mutex> lock(agl_attempt_mutex);
-        if (agl_active_attempt == id) {
-            agl_active_attempt.clear();
-            agl_cancel_requested.store(false);
+        const auto found = agl_active_attempts.find(id);
+        if (found != agl_active_attempts.end() && found->second == state) {
+            agl_active_attempts.erase(found);
         }
     }
 };
@@ -215,6 +221,7 @@ static server_http_res_ptr agl_private_live_inventory(const server_http_req &) {
 
 static server_http_res_ptr agl_private_generate(
         const server_http_context::handler_t & generate,
+        const size_t max_active_attempts,
         const server_http_req & req) {
     constexpr size_t AGL_MAX_MEDIA_BYTES = 64 * 1024 * 1024;
     constexpr size_t AGL_MAX_MEDIA_PARTS = 64;
@@ -239,16 +246,20 @@ static server_http_res_ptr agl_private_generate(
         throw std::invalid_argument("AGL generation omitted a bounded attempt identity");
     }
     body.erase("agl_attempt_id");
-    {
-        std::lock_guard<std::mutex> lock(agl_attempt_mutex);
-        if (!agl_active_attempt.empty()) {
-            throw std::invalid_argument("AGL private engine already has an active attempt");
-        }
-        agl_active_attempt = attempt_id;
-        agl_cancel_requested.store(false);
-    }
+    auto state = std::make_shared<agl_attempt_state>();
     auto guard = std::make_shared<agl_attempt_guard>();
     guard->id = attempt_id;
+    guard->state = state;
+    {
+        std::lock_guard<std::mutex> lock(agl_attempt_mutex);
+        if (agl_active_attempts.find(attempt_id) != agl_active_attempts.end()) {
+            throw std::invalid_argument("AGL private engine already has this active attempt");
+        }
+        if (agl_active_attempts.size() >= max_active_attempts) {
+            throw std::invalid_argument("AGL private engine active attempt capacity is full");
+        }
+        agl_active_attempts.emplace(attempt_id, state);
+    }
 
     auto & messages = body.at("messages");
     if (!messages.is_array()) {
@@ -318,8 +329,8 @@ static server_http_res_ptr agl_private_generate(
     // The private host owns cancellation through the typed control route.
     // cpp-httplib's stock connection predicate is not authoritative for the
     // inherited Unix connection and can report closed after the begin frame.
-    const std::function<bool()> should_stop = []() {
-        return agl_cancel_requested.load();
+    const std::function<bool()> should_stop = [state]() {
+        return state->cancel_requested.load();
     };
     auto headers = req.headers;
     headers["X-AGL-Attempt-ID"] = attempt_id;
@@ -349,13 +360,16 @@ static server_http_res_ptr agl_private_control(const server_http_req & req) {
     if (attempt_id.empty() || action != "cancel" || body.size() != 2) {
         throw std::invalid_argument("invalid AGL control request");
     }
+    std::shared_ptr<agl_attempt_state> state;
     {
         std::lock_guard<std::mutex> lock(agl_attempt_mutex);
-        if (agl_active_attempt != attempt_id) {
+        const auto found = agl_active_attempts.find(attempt_id);
+        if (found == agl_active_attempts.end()) {
             throw std::invalid_argument("AGL control attempt is not active");
         }
-        agl_cancel_requested.store(true);
+        state = found->second;
     }
+    state->cancel_requested.store(true);
     auto response = std::make_unique<server_http_res>();
     response->data = safe_json_to_str({
         {"schema", "agentlibre.llama-cancel/v1"},
@@ -534,8 +548,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
         ctx_http.get ("/agl/v1/readiness",     ex_wrapper(routes.get_agl_readiness));
         ctx_http.get ("/agl/v1/inventory",     ex_wrapper(agl_private_live_inventory));
-        ctx_http.post("/agl/v1/generate",      ex_wrapper([&routes](const server_http_req & req) {
-            return agl_private_generate(routes.post_chat_completions, req);
+        const size_t max_active_attempts =
+            static_cast<size_t>(std::max<int32_t>(1, params.n_parallel));
+        ctx_http.post("/agl/v1/generate",      ex_wrapper([&routes, max_active_attempts](const server_http_req & req) {
+            return agl_private_generate(routes.post_chat_completions, max_active_attempts, req);
         }));
         ctx_http.post("/agl/v1/control",       ex_wrapper(agl_private_control));
         ctx_http.post("/agl/v1/slot/:id_slot", ex_wrapper(routes.post_slots));

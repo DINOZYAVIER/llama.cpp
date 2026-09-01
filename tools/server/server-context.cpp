@@ -4318,6 +4318,18 @@ void server_context::set_state_callback(server_state_callback_t callback) {
     impl->callback_state = std::move(callback);
 }
 
+static std::string format_agl_stream_error_frame(
+        const std::string & attempt_id,
+        uint64_t & sequence,
+        const json & error) {
+    return safe_json_to_str({
+        {"schema", "agentlibre.llama-stream/v1"},
+        {"attempt_id", attempt_id},
+        {"sequence", ++sequence},
+        {"kind", "error"},
+        {"error", error},
+    }) + "\n";
+
 static std::string format_agl_stream_frame(
         server_task_result & result,
         const std::string & attempt_id,
@@ -4326,13 +4338,7 @@ static std::string format_agl_stream_frame(
         bool & terminal) {
     if (result.is_error()) {
         terminal = true;
-        return safe_json_to_str({
-            {"schema", "agentlibre.llama-stream/v1"},
-            {"attempt_id", attempt_id},
-            {"sequence", ++sequence},
-            {"kind", "error"},
-            {"error", result.to_json()},
-        }) + "\n";
+        return format_agl_stream_error_frame(attempt_id, sequence, result.to_json());
     }
 
     if (auto * partial = dynamic_cast<server_task_result_cmpl_partial *>(&result)) {
@@ -4494,7 +4500,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // non-stream, wait for the results
         auto all_results = rd.wait_for_all(req.should_stop);
         if (all_results.is_terminated) {
-            return res; // connection is closed
+            return res;
         } else if (all_results.error) {
             res->error(all_results.error->to_json());
             return res;
@@ -4540,9 +4546,32 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // in streaming mode, the first error must be treated as non-stream response
         // this is to match the OAI API behavior
         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
+        const auto agl_protocol = req.headers.find("X-AGL-Protocol");
+        const auto agl_attempt = req.headers.find("X-AGL-Attempt-ID");
+        const bool agl_stream = agl_protocol != req.headers.end() && agl_protocol->second == "1";
+        if (agl_stream && (agl_attempt == req.headers.end() || agl_attempt->second.empty())) {
+            res->error(format_error_response("AGL stream omitted attempt identity", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
         auto first_result = rd.next(req.should_stop);
         if (first_result == nullptr) {
             GGML_ASSERT(req.should_stop());
+            if (agl_stream) {
+                uint64_t sequence = 0;
+                res->status = 200;
+                res->content_type = "application/x-ndjson";
+                res->data = format_agl_stream_error_frame(
+                        agl_attempt->second, sequence, {{"message", "cancelled"}});
+                res->next = [res_this = res.get()](std::string & output) -> bool {
+                    if (res_this->data.empty()) {
+                        return false;
+                    }
+                    output = std::move(res_this->data);
+                    res_this->data.clear();
+                    return true;
+                };
+            }
             return res; // connection is closed
         }
 
@@ -4555,14 +4584,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
             dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
         );
-
-        const auto agl_protocol = req.headers.find("X-AGL-Protocol");
-        const auto agl_attempt = req.headers.find("X-AGL-Attempt-ID");
-        const bool agl_stream = agl_protocol != req.headers.end() && agl_protocol->second == "1";
-        if (agl_stream && (agl_attempt == req.headers.end() || agl_attempt->second.empty())) {
-            res->error(format_error_response("AGL stream omitted attempt identity", ERROR_TYPE_INVALID_REQUEST));
-            return res;
-        }
 
         if (agl_stream) {
             auto sequence = std::make_shared<uint64_t>(0);
@@ -4590,7 +4611,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     auto result = res_this->rd.next(req.should_stop);
                     if (result == nullptr) {
                         if (req.should_stop()) {
-                            return false;
+                            terminal = true;
+                            output = format_agl_stream_error_frame(
+                                    attempt_id, *sequence, {{"message", "cancelled"}});
+                            return true;
                         }
                         throw std::runtime_error("AGL result stream ended without a terminal frame");
                     }
@@ -4599,13 +4623,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     return true;
                 } catch (const std::exception & e) {
                     terminal = true;
-                    output = safe_json_to_str({
-                        {"schema", "agentlibre.llama-stream/v1"},
-                        {"attempt_id", attempt_id},
-                        {"sequence", ++*sequence},
-                        {"kind", "error"},
-                        {"error", {{"message", e.what()}}},
-                    }) + "\n";
+                    output = format_agl_stream_error_frame(
+                            attempt_id, *sequence, {{"message", e.what()}});
                     return true;
                 }
             };
