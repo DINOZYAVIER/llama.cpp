@@ -4393,6 +4393,7 @@ static std::string format_agl_stream_frame(
             {"cached_tokens", final->n_prompt_tokens_cache},
             {"chunks", final->n_prompt_chunks},
         }},
+        {"timings", final->timings.to_json()},
     }) + "\n";
 }
 
