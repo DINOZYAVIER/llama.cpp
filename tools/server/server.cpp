@@ -548,6 +548,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
         ctx_http.get ("/agl/v1/readiness",     ex_wrapper(routes.get_agl_readiness));
         ctx_http.get ("/agl/v1/inventory",     ex_wrapper(agl_private_live_inventory));
+        ctx_http.post("/agl/v1/input-tokens",   ex_wrapper(routes.post_chat_completions_tok));
         const size_t max_active_attempts =
             static_cast<size_t>(std::max<int32_t>(1, params.n_parallel));
         ctx_http.post("/agl/v1/generate",      ex_wrapper([&routes, max_active_attempts](const server_http_req & req) {
