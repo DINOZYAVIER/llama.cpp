@@ -333,6 +333,7 @@ static server_http_res_ptr agl_private_generate(
         return state->cancel_requested.load();
     };
     auto headers = req.headers;
+    headers["X-AGL-Protocol"] = "1";
     headers["X-AGL-Attempt-ID"] = attempt_id;
     auto normalized = std::make_shared<server_http_req>(server_http_req {
         req.params,
