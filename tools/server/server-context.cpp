@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -3862,6 +3863,7 @@ private:
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
+                slot.n_prompt_chunks++;
                 if (slot.task->params.stream && slot.task->params.return_progress) {
                     send_partial_response(slot, {}, true);
                 }
@@ -4031,18 +4033,6 @@ private:
             }
             slot.spec_is_replay = false;
 
-                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
-                    slot.n_prompt_chunks++;
-                }
-
-                if (slot.state == SLOT_STATE_DONE_PROMPT) {
-                    if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
-                        // prompt evaluated for embedding
-                        send_embedding(slot, batch_view);
-                        slot.release();
-                        slot.i_batch = -1;
-                        continue; // continue loop of slots
-                    }
             slot.stats.update_gen_last();
 
             // update how many tokens out of those tested were accepted
@@ -4330,6 +4320,7 @@ static std::string format_agl_stream_error_frame(
         {"kind", "error"},
         {"error", error},
     }) + "\n";
+}
 
 static std::string format_agl_stream_frame(
         server_task_result & result,
@@ -4393,12 +4384,8 @@ static std::string format_agl_stream_frame(
             {"cached_tokens", final->n_prompt_tokens_cache},
             {"chunks", final->n_prompt_chunks},
         }},
-        {"timings", final->timings.to_json()},
+        {"timings", final->stats.to_json()},
     }) + "\n";
-}
-
-void server_context::on_sleeping_changed(std::function<void(bool)> callback) {
-    impl->queue_tasks.on_sleeping_state(std::move(callback));
 }
 
 //
@@ -5074,16 +5061,13 @@ void server_routes::init_routes() {
             // New keys
             { "ui",                           params.ui },
             { "ui_settings",                  meta->json_ui_settings },
-            // Deprecated: use ui/ui_settings instead (kept for backward compat)
-            { "webui",                        params.webui },
-            { "webui_settings",               meta->json_webui_settings },
             { "chat_template",               tmpl_default },
             { "chat_template_caps",          meta->chat_template_caps },
             { "bos_token",                   meta->bos_token_str },
             { "eos_token",                   meta->eos_token_str },
             { "build_info",                  meta->build_info },
             { "is_sleeping",                 queue_tasks.is_sleeping() },
-            { "cors_proxy_enabled",          params.ui_mcp_proxy || params.webui_mcp_proxy },
+            { "cors_proxy_enabled",          params.ui_mcp_proxy },
         };
         if (params.use_jinja) {
             if (!tmpl_tools.empty()) {

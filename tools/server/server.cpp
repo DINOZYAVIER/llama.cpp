@@ -145,13 +145,8 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
-int llama_server(int argc, char ** argv) {
-    std::setlocale(LC_NUMERIC, "C");
-
-#ifndef _WIN32
-    // Ignore SIGPIPE so the server does not crash if a child (MCP server, tools runtime) exits while we are writing to its stdin
-    signal(SIGPIPE, SIG_IGN);
-#endif
+// satisfies -Wmissing-declarations
+int llama_server(int argc, char ** argv);
 
 static json agl_inventory_payload() {
     json devices = json::array();
