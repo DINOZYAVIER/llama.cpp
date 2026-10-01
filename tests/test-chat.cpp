@@ -2133,6 +2133,39 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         "const": "42"
     })";
 
+    for (const char * template_path : { "models/templates/Qwen3-Coder.jinja", "models/templates/Qwen3.5-4B.jinja" }) {
+        auto tst = peg_tester(template_path, detailed_debug);
+        const std::string content = R"({"amount":42,"date":"2026-09-30"})";
+        const std::string call = "<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\n</parameter>\n</function>\n</tool_call>";
+
+        tst.test(content).enable_thinking(false).reasoning_format(COMMON_REASONING_FORMAT_AUTO).tools({ special_function_tool }).json_schema(invoice_schema).expect_content(content).run();
+        tst.test(content).enable_thinking(false).reasoning_format(COMMON_REASONING_FORMAT_NONE).tools({ special_function_tool }).json_schema(invoice_schema).expect_content(content).run();
+        tst.test(call).enable_thinking(false).reasoning_format(COMMON_REASONING_FORMAT_AUTO).tools({ special_function_tool }).json_schema(invoice_schema).expect(message_assist_call).run();
+        tst.test(call).enable_thinking(false).reasoning_format(COMMON_REASONING_FORMAT_NONE).tools({ special_function_tool }).json_schema(invoice_schema).expect(message_assist_call).run();
+        tst.test(call + "\n" + call).enable_thinking(false).reasoning_format(COMMON_REASONING_FORMAT_NONE).tools({ special_function_tool }).json_schema(invoice_schema).parallel_tool_calls(true).expect_tool_calls({ { "special_function", R"({"arg1":1})", {} }, { "special_function", R"({"arg1":1})", {} } }).run();
+        tst.test(call).enable_thinking(false).reasoning_format(COMMON_REASONING_FORMAT_AUTO).tools({ special_function_tool }).json_schema(invoice_schema).tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED).expect(message_assist_call).run();
+        tst.test(content).enable_thinking(false).reasoning_format(COMMON_REASONING_FORMAT_AUTO).tools({ special_function_tool }).json_schema(invoice_schema).tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE).expect_content(content).run();
+
+        if (std::string(template_path).find("Qwen3.5") != std::string::npos) {
+            tst.test("Thinking\n</think>\n\n" + content).enable_thinking(true).reasoning_format(COMMON_REASONING_FORMAT_AUTO).tools({ special_function_tool }).json_schema(invoice_schema).expect_reasoning("Thinking").expect_content(content).run();
+            tst.test("Thinking\n</think>\n\n" + call).enable_thinking(true).reasoning_format(COMMON_REASONING_FORMAT_AUTO).tools({ special_function_tool }).json_schema(invoice_schema).expect_reasoning("Thinking").expect_tool_calls({ { "special_function", R"({"arg1":1})", {} } }).run();
+        }
+
+        auto tmpls = read_templates(template_path);
+        common_chat_templates_inputs inputs;
+        inputs.messages = { message_user };
+        inputs.tools = { special_function_tool };
+        inputs.json_schema = invoice_schema;
+        inputs.enable_thinking = false;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+        auto parser = make_peg_parser(tmpls.get(), inputs);
+        assert(!parser.params_.grammar_lazy);
+        for (const std::string invalid : { R"({"amount":"wrong"})", "free prose", "" }) {
+            auto grammar = build_grammar(parser.params_.grammar);
+            assert(!match_string_detailed(parser.params_.generation_prompt + invalid, grammar.get()).success);
+        }
+    }
+
     {
         // Qwen3.5 (basically same as Nemotron, but keeping separate tests just in case)
         auto tst = peg_tester("models/templates/Qwen3.5-4B.jinja", detailed_debug);

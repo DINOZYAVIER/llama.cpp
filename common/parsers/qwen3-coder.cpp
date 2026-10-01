@@ -79,10 +79,12 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
             reasoning = p.optional("<think>" + p.space() +
                                    p.reasoning(p.until_one_of({ "</think>", "<tool_call>" })) +
                                    (p.literal("</think>") | p.peek(p.literal("<tool_call>"))));
+        } else if (supports_reasoning && has_response_format) {
+            reasoning = p.optional("<think>" + p.space() + "</think>" + p.space());
         }
 
         // Response format parser
-        if (has_response_format) {
+        if (has_response_format && (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE)) {
             return generation_prompt + (reasoning << p.content(p.schema(p.json(), "response-format", inputs.json_schema)));
         }
 
@@ -153,7 +155,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                 tool_choice |= p.rule("tool-" + name, func);
             });
 
-            auto min_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
+            auto min_calls = has_response_format || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
 
             auto tool_call_body = tool_choice + "</tool_call>" + p.space();
             auto tool_call      = p.rule("tool-call", "<tool_call>\n" + tool_call_body);
@@ -166,6 +168,14 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
             auto calls      = inputs.parallel_tool_calls ? tool_call_first + p.zero_or_more(tool_call) : tool_call_first;
             auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(calls, min_calls, 1));
 
+            if (has_response_format) {
+                if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+                    return generation_prompt + (reasoning << tool_calls);
+                }
+                auto content = p.content(p.schema(p.json(), "response-format", inputs.json_schema));
+                return generation_prompt + (reasoning << (tool_calls | content));
+            }
+
             return generation_prompt +
                    (reasoning << p.content(p.until_one_of(tool_call_starts)) << tool_calls);
         }
@@ -177,7 +187,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
     data.parser = parser.save();
 
     if (include_grammar) {
-        data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+        data.grammar_lazy = !has_response_format && has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
 
         data.grammar = build_grammar([&](const common_grammar_builder & builder) {
             parser.build_grammar(builder, data.grammar_lazy);
