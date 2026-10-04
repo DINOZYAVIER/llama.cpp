@@ -6,7 +6,6 @@
 #include "server-tools.h"
 
 #include "arg.h"
-#include "base64.hpp"
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
@@ -22,7 +21,6 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
-#include <unordered_set>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
 
@@ -214,27 +212,43 @@ static server_http_res_ptr agl_private_live_inventory(const server_http_req &) {
     return response;
 }
 
+static void agl_validate_media(const json & body) {
+    const auto & messages = body.at("messages");
+    if (!messages.is_array()) {
+        throw std::invalid_argument("AGL messages must be an array");
+    }
+    for (const auto & message : messages) {
+        if (!message.is_object() || !message.contains("content") || !message.at("content").is_array()) {
+            continue;
+        }
+        for (const auto & part : message.at("content")) {
+            if (!part.is_object()) {
+                throw std::invalid_argument("AGL message content part must be an object");
+            }
+            const std::string type = json_value(part, "type", std::string());
+            if (type == "text" && part.contains("text") && part.at("text").is_string()) {
+                continue;
+            }
+            if (type == "image_url" && part.contains("image_url") && part.at("image_url").is_object()) {
+                const std::string url = json_value(part.at("image_url"), "url", std::string());
+                if (url.compare(0, 11, "data:image/") == 0 && url.find(";base64,") != std::string::npos) {
+                    continue;
+                }
+            }
+            throw std::invalid_argument("private AGL media must contain inline image data");
+        }
+    }
+}
+
 static server_http_res_ptr agl_private_generate(
         const server_http_context::handler_t & generate,
         const size_t max_active_attempts,
         const server_http_req & req) {
-    constexpr size_t AGL_MAX_MEDIA_BYTES = 64 * 1024 * 1024;
-    constexpr size_t AGL_MAX_MEDIA_PARTS = 64;
-
-    json body;
-    if (req.files.empty()) {
-        body = json::parse(req.body);
-    } else {
-        if (req.files.size() > AGL_MAX_MEDIA_PARTS) {
-            throw std::invalid_argument("AGL media part count exceeds 64");
-        }
-        const json envelope = json::parse(req.body);
-        if (!envelope.is_object() || envelope.size() != 1 || !envelope.contains("request") ||
-            !envelope.at("request").is_string()) {
-            throw std::invalid_argument("AGL multipart body must contain one request field");
-        }
-        body = json::parse(envelope.at("request").get<std::string>());
+    if (!req.files.empty()) {
+        throw std::invalid_argument("private AGL generation accepts a JSON body only");
     }
+    json body = json::parse(req.body);
+    agl_validate_media(body);
 
     const std::string attempt_id = json_value(body, "agl_attempt_id", std::string());
     if (attempt_id.empty() || attempt_id.size() > 128) {
@@ -254,67 +268,6 @@ static server_http_res_ptr agl_private_generate(
             throw std::invalid_argument("AGL private engine active attempt capacity is full");
         }
         agl_active_attempts.emplace(attempt_id, state);
-    }
-
-    auto & messages = body.at("messages");
-    if (!messages.is_array()) {
-        throw std::invalid_argument("AGL messages must be an array");
-    }
-    std::unordered_set<std::string> used;
-    size_t total_media_bytes = 0;
-    for (auto & message : messages) {
-        if (!message.is_object() || !message.contains("content")) {
-            continue;
-        }
-        auto & content = message["content"];
-        if (!content.is_array()) {
-            continue;
-        }
-        for (auto & part : content) {
-            if (!part.is_object()) {
-                throw std::invalid_argument("AGL message content part must be an object");
-            }
-            const std::string type = json_value(part, "type", std::string());
-            if (type == "text") {
-                if (!part.contains("text") || !part.at("text").is_string()) {
-                    throw std::invalid_argument("AGL text content part is invalid");
-                }
-                continue;
-            }
-            if (type != "agl_attachment") {
-                throw std::invalid_argument("private AGL generation rejects URL and path media");
-            }
-            const std::string id = json_value(part, "id", std::string());
-            const std::string media_type = json_value(part, "media_type", std::string());
-            const uint64_t byte_length = json_value(part, "byte_length", UINT64_C(0));
-            if (id.empty() || !used.insert(id).second) {
-                throw std::invalid_argument("AGL attachment identity is empty or duplicated");
-            }
-            const auto found = req.files.find(id);
-            if (found == req.files.end()) {
-                throw std::invalid_argument("AGL attachment bytes are missing");
-            }
-            const auto & file = found->second;
-            if ((media_type != "image/png" && media_type != "image/jpeg") ||
-                file.content_type != media_type || file.filename != id ||
-                byte_length != file.data.size()) {
-                throw std::invalid_argument("AGL attachment metadata does not match multipart bytes");
-            }
-            if (file.data.size() > AGL_MAX_MEDIA_BYTES - total_media_bytes) {
-                throw std::invalid_argument("AGL media bytes exceed 64 MiB");
-            }
-            total_media_bytes += file.data.size();
-            const auto * data = reinterpret_cast<const char *>(file.data.data());
-            part = {
-                {"type", "image_url"},
-                {"image_url", {
-                    {"url", "data:" + media_type + ";base64," + base64::encode(data, file.data.size())},
-                }},
-            };
-        }
-    }
-    if (used.size() != req.files.size()) {
-        throw std::invalid_argument("AGL multipart contains an unreferenced file");
     }
 
     // The private protocol always streams bounded, identity-bearing frames.
@@ -544,7 +497,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
         ctx_http.get ("/agl/v1/readiness",     ex_wrapper(routes.get_agl_readiness));
         ctx_http.get ("/agl/v1/inventory",     ex_wrapper(agl_private_live_inventory));
-        ctx_http.post("/agl/v1/input-tokens",   ex_wrapper(routes.post_chat_completions_tok));
+        ctx_http.post("/agl/v1/input-tokens",   ex_wrapper([&routes](const server_http_req & req) {
+            agl_validate_media(json::parse(req.body));
+            return routes.post_chat_completions_tok(req);
+        }));
+        ctx_http.post("/tokenize",              ex_wrapper(routes.post_tokenize));
         const size_t max_active_attempts =
             static_cast<size_t>(std::max<int32_t>(1, params.n_parallel));
         ctx_http.post("/agl/v1/generate",      ex_wrapper([&routes, max_active_attempts](const server_http_req & req) {
